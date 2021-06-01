@@ -573,6 +573,7 @@ enum algos {
         ALGO_TRIBUS,
         ALGO_VANILLA,
         ALGO_VELTOR,
+        ALGO_VERTHASH,
         ALGO_WHIRLPOOL,
         ALGO_WHIRLPOOLX,
         ALGO_X11,
@@ -667,6 +668,7 @@ static const char* const algo_names[] = {
         "tribus",
         "vanilla",
         "veltor",
+        "verthash",
         "whirlpool",
         "whirlpoolx",
         "x11",
@@ -739,7 +741,6 @@ extern uint32_t opt_work_size;
 extern double *thr_hashrates;
 extern double global_hashrate;
 extern double stratum_diff;
-extern bool opt_reset_on_stale;
 extern double net_diff;
 extern double net_hashrate;
 extern int opt_param_n;
@@ -764,6 +765,8 @@ extern pthread_mutex_t stats_lock;
 extern bool opt_sapling;
 extern const int pk_buffer_size_max;
 extern int pk_buffer_size;
+extern char *opt_data_file;
+extern bool opt_verify;
 
 static char const usage[] = "\
 Usage: cpuminer [OPTIONS]\n\
@@ -828,6 +831,7 @@ Options:\n\
                           tribus        Denarius (DNR)\n\
                           vanilla       blake256r8vnl (VCash)\n\
                           veltor\n\
+                          verthash\n\
                           whirlpool\n\
                           whirlpoolx\n\
                           x11           Dash\n\
@@ -902,12 +906,14 @@ Options:\n\
       --benchmark       run in offline benchmark mode\n\
       --cpu-affinity    set process affinity to cpu core(s), mask 0x3 for cores 0 and 1\n\
       --cpu-priority    set process priority (default: 0 idle, 2 normal to 5 highest)\n\
-  -b, --api-bind        IP/Port for the miner API (default: 127.0.0.1:4048)\n\
+  -b, --api-bind=address[:port]   IP address for the miner API, default port is 4048)\n\
       --api-remote      Allow remote control\n\
       --max-temp=N      Only mine if cpu temp is less than specified value (linux)\n\
       --max-rate=N[KMG] Only mine if net hashrate is less than specified value\n\
       --max-diff=N      Only mine if net difficulty is less than specified value\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
+      --data-file       path and name of data file\n\
+      --verify          enable additional time consuming start up tests\n\
   -V, --version         display version information and exit\n\
   -h, --help            display this help text and exit\n\
 ";
@@ -965,7 +971,6 @@ static struct option const options[] = {
         { "retries", 1, NULL, 'r' },
         { "retry-pause", 1, NULL, 1025 },
         { "randomize", 0, NULL, 1024 },
-        { "reset-on-stale", 0, NULL, 1026 },
         { "scantime", 1, NULL, 's' },
 #ifdef HAVE_SYSLOG_H
         { "syslog", 0, NULL, 'S' },
@@ -976,6 +981,8 @@ static struct option const options[] = {
         { "url", 1, NULL, 'o' },
         { "user", 1, NULL, 'u' },
         { "userpass", 1, NULL, 'O' },
+        { "data-file", 1, NULL, 1027 },
+        { "verify", 0, NULL, 1028 },
         { "version", 0, NULL, 'V' },
         { 0, 0, 0, 0 }
 };

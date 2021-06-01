@@ -65,6 +65,38 @@ If not what makes it happen or not happen?
 Change Log
 ----------
 
+v3.16.3
+
+#313 Fix compile error with GCC 11.
+Incremental improvements to verthash.
+
+v3.16.2
+
+Verthash: midstate prehash optimization for all architectures.
+Verthash: AVX2 optimization.
+GBT: added support for Bech32 addresses.
+Linux: added CPU frequency to benchmark log.
+Fixed integer overflow in time calculations.
+
+v3.16.1
+
+New options for verthash:
+  --data-file to specify the name, and optionally the path, of the verthash
+              data file, default is "verthash.dat" in the current directory.
+  --verify to perform the data file integrity check at startup, default is
+           not to verify data file integrity.
+Support for creation of default verthash data file if:
+   1) --data-file option is not used,
+   2) no default data file is found in the current directory, and,
+   3) --verify option is used.
+More detailed logs related to verthash data file.
+Small verthash performance improvement.
+Fixed detection of corrupt stats caused by networking issues.
+
+v3.16.0
+
+Added verthash algo.
+
 v3.15.7
 
 Added accepted/stale/rejected percentage to summary log report.
@@ -84,7 +116,6 @@ RPC getmininginfo method.
 v3.15.5
 
 Fix stratum jobs lost if 2 jobs received in less than one second.
- 
 
 v3.15.4
 

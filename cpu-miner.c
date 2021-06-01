@@ -112,21 +112,20 @@ char* opt_param_key = NULL;
 int opt_param_n = 0;
 int opt_param_r = 0;
 int opt_n_threads = 0;
-bool opt_reset_on_stale = false;
 bool opt_sapling = false;
 
 // Windows doesn't support 128 bit affinity mask.
 // Need compile time and run time test.
 #if defined(__linux) && defined(GCC_INT128)  
 #define AFFINITY_USES_UINT128 1
-uint128_t opt_affinity = -1;
+static uint128_t opt_affinity = -1;
 static bool affinity_uses_uint128 = true;
 #else
-uint64_t opt_affinity = -1;
+static uint64_t opt_affinity = -1;
 static bool affinity_uses_uint128 = false;
 #endif
 
-int opt_priority = 0;
+int opt_priority = 0;  // deprecated
 int num_cpus = 1;
 int num_cpugroups = 1;
 char *rpc_url = NULL;;
@@ -134,6 +133,8 @@ char *rpc_userpass = NULL;
 char *rpc_user, *rpc_pass;
 char *short_url = NULL;
 char *coinbase_address;
+char *opt_data_file = NULL;
+bool opt_verify = false;
 
 // pk_buffer_size is used as a version selector by b58 code, therefore
 // it must be set correctly to work.
@@ -552,7 +553,11 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
          if ( !s )
             continue;
          if ( !strcmp( s, "segwit" ) || !strcmp( s, "!segwit" ) )
+         {
             segwit = true;
+            if ( opt_debug )
+               applog( LOG_INFO, "GBT: SegWit is enabled" );
+         }
       }
    }
 // Segwit END
@@ -951,25 +956,25 @@ void scale_hash_for_display ( double* hashrate, char* prefix )
   else                          { *prefix = 'Y';  *hashrate /= 1e24; }
 }
 
-static inline void sprintf_et( char *str, int seconds )
+static inline void sprintf_et( char *str, long unsigned int seconds )
 {
-   // sprintf doesn't like uint64_t, Linux thinks it's long, Windows long long.
-   unsigned int min = seconds / 60;
-   unsigned int sec = seconds % 60;
-   unsigned int hrs = min / 60;
+   long unsigned int min = seconds / 60;
+   long unsigned int sec = seconds % 60;
+   long unsigned int hrs = min / 60;
+   
    if ( unlikely( hrs ) )   
    {
-      unsigned int years = hrs / (24*365);
-      unsigned int days = hrs / 24;
-      if ( years )
-         sprintf( str, "%uy%ud", years, years % 365 );
-      else if ( days )  //0d00h
-         sprintf( str, "%ud%02uh", days, hrs % 24 );
+      long unsigned int days = hrs / 24;
+      long unsigned int years = days / 365;
+      if ( years )      // 0y000d
+         sprintf( str, "%luy%lud", years, years % 365 );
+      else if ( days )  // 0d00h
+         sprintf( str, "%lud%02luh", days, hrs % 24 );
       else         // 0h00m  
-         sprintf( str, "%uh%02um", hrs, min % 60 );
+         sprintf( str, "%luh%02lum", hrs, min % 60 );
    }
    else         // 0m00s
-      sprintf( str, "%um%02us", min, sec );
+      sprintf( str, "%lum%02lus", min, sec );
 }
 
 const long double exp32 = EXP32;                                  // 2**32
@@ -1068,12 +1073,12 @@ void report_summary_log( bool force )
    
    double share_time = (double)et.tv_sec + (double)et.tv_usec / 1e6;
    double ghrate = global_hashrate;
-   double shrate = share_time == 0. ? 0. : exp32 * last_targetdiff
-                                           * (double)(accepts) / share_time;
-   double sess_hrate = uptime.tv_sec == 0. ? 0. : exp32 * norm_diff_sum
-                                                / (double)uptime.tv_sec;
-   double submit_rate = share_time == 0. ? 0. : (double)submits*60.
-                                                / share_time;
+   double target_diff = exp32 * last_targetdiff;
+   double shrate = safe_div( target_diff * (double)(accepts),
+                             share_time, 0. );
+   double sess_hrate = safe_div( exp32 * norm_diff_sum,
+                                 (double)uptime.tv_sec, 0. );
+   double submit_rate = safe_div( (double)submits * 60., share_time, 0. );
    char shr_units[4] = {0};
    char ghr_units[4] = {0};
    char sess_hr_units[4] = {0};
@@ -1090,55 +1095,57 @@ void report_summary_log( bool force )
    applog( LOG_BLUE, "%s: %s", algo_names[ opt_algo ], short_url );
    applog2( LOG_NOTICE, "Periodic Report     %s        %s", et_str, upt_str );
    applog2( LOG_INFO, "Share rate        %.2f/min     %.2f/min",
-                      submit_rate, (double)submitted_share_count*60. /
-                    ( (double)uptime.tv_sec + (double)uptime.tv_usec / 1e6 ) );
+            submit_rate, (double)submitted_share_count*60. /
+            ( (double)uptime.tv_sec + (double)uptime.tv_usec / 1e6 ) );
    applog2( LOG_INFO, "Hash rate       %7.2f%sh/s   %7.2f%sh/s   (%.2f%sh/s)",
-                     shrate, shr_units, sess_hrate, sess_hr_units, 
-                     ghrate, ghr_units );
+            shrate, shr_units, sess_hrate, sess_hr_units, ghrate, ghr_units );
 
    if ( accepted_share_count < submitted_share_count )
    {
-      double ltd = exp32 * last_targetdiff;
       double lost_ghrate = uptime.tv_sec == 0 ? 0.
-                : ltd * (double)(submitted_share_count - accepted_share_count )
+                : target_diff
+                       * (double)(submitted_share_count - accepted_share_count )
                   / (double)uptime.tv_sec;
       double lost_shrate = share_time == 0. ? 0.
-               : ltd  * (double)(submits - accepts ) / share_time;
+               : target_diff  * (double)(submits - accepts ) / share_time;
       char lshr_units[4] = {0};
       char lghr_units[4] = {0};
       scale_hash_for_display( &lost_shrate, lshr_units );
       scale_hash_for_display( &lost_ghrate, lghr_units );
-      applog2( LOG_INFO, "Lost hash rate  %7.2f%sh/s   %7.2f%sh/s",
-                     lost_shrate, lshr_units, lost_ghrate, lghr_units );
+      applog2( LOG_INFO, "Lost hash rate  %7.2f%sh/s    %7.2f%sh/s",
+               lost_shrate, lshr_units, lost_ghrate, lghr_units );
    }
 
-   applog2( LOG_INFO,"Submitted        %6d       %6d",
-                       submits, submitted_share_count );
-   applog2( LOG_INFO,"Accepted         %6d       %6d      %5.1f%%",
-                       accepts, accepted_share_count,
-                      100. * accepted_share_count / submitted_share_count );
+   applog2( LOG_INFO,"Submitted       %7d      %7d",
+               submits, submitted_share_count );
+   applog2( LOG_INFO, "Accepted        %7d      %7d      %5.1f%%",
+                      accepts, accepted_share_count,
+                      100. * safe_div( (double)accepted_share_count, 
+                                       (double)submitted_share_count, 0. ) ); 
    if ( stale_share_count )
-      applog2( LOG_INFO,"Stale            %6d       %6d      %5.1f%%",
-                       stales, stale_share_count,
-                       100. * stale_share_count / submitted_share_count );
+      applog2( LOG_INFO, "Stale           %7d      %7d      %5.1f%%",
+                      stales, stale_share_count,
+                      100. * safe_div( (double)stale_share_count,
+                                       (double)submitted_share_count, 0. ) );
    if ( rejected_share_count )
-      applog2( LOG_INFO,"Rejected         %6d       %6d      %5.1f%%",
-                       rejects, rejected_share_count,
-                       100. * rejected_share_count / submitted_share_count );
+      applog2( LOG_INFO, "Rejected        %7d      %7d      %5.1f%%",
+                      rejects, rejected_share_count,
+                      100. * safe_div( (double)rejected_share_count,
+                                       (double)submitted_share_count, 0. ) );
    if ( solved_block_count )
-      applog2( LOG_INFO,"Blocks Solved    %6d       %6d",
-                         solved, solved_block_count );
+      applog2( LOG_INFO,"Blocks Solved   %7d      %7d",
+               solved, solved_block_count );
    applog2( LOG_INFO, "Hi/Lo Share Diff  %.5g /  %.5g",
-                       highest_share, lowest_share );
+               highest_share, lowest_share );
 
-   static int64_t no_acks = 0;
-   if ( no_acks )
-   {
-      no_acks = submitted_share_count
+   int mismatch = submitted_share_count
          - ( accepted_share_count + stale_share_count + rejected_share_count );
-      if ( no_acks )  // 2 consecutive cycles non zero
-         applog(LOG_WARNING,"Share count mismatch: %d, stats may be incorrect",
-                no_acks );
+   if ( mismatch )
+   {
+      if ( mismatch != 1 )
+         applog(LOG_WARNING,"Share count mismatch: %d, stats may be inaccurate", mismatch );
+      else
+         applog(LOG_INFO,"Share count mismatch, submitted share may still be pending" );
    }
 }
 
@@ -1292,7 +1299,8 @@ static int share_result( int result, struct work *work,
       if ( reason ) applog( LOG_WARNING, "Reject reason: %s", reason );
          
       diff_to_hash( str, my_stats.share_diff );
-      applog2( LOG_INFO, "Hash:   %08x%08x%08x...", str[7], str[6], str[5] );
+      applog2( LOG_INFO, "Hash:   %08x%08x%08x%08x%08x%08x", str[7], str[6],
+               str[5], str[4], str[3],str[2], str[1], str[0] );
 
       if ( work )
          targ = work->target;
@@ -1301,7 +1309,8 @@ static int share_result( int result, struct work *work,
          diff_to_hash( str, my_stats.target_diff );
          targ = &str[0];
       }
-      applog2( LOG_INFO, "Target: %08x%08x%08x...", targ[7], targ[6], targ[5] );
+      applog2( LOG_INFO, "Target: %08x%08x%08x%08x%08x%08x", targ[7], targ[6],
+               targ[5], targ[4], targ[3], targ[2], targ[1], targ[0] );
    }
    return 1;
 }
@@ -2160,11 +2169,11 @@ static void *miner_thread( void *userdata )
    /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
     * and if that fails, then SCHED_BATCH. No need for this to be an
     * error if it fails */
-   if (!opt_benchmark && opt_priority == 0)
+   if ( !opt_priority )
    {
       setpriority(PRIO_PROCESS, 0, 19);
-      if ( !thr_id && !opt_quiet )
-         applog(LOG_INFO, "Miner thread priority %d (nice 19)", opt_priority );
+      if ( !thr_id && opt_debug )
+         applog(LOG_INFO, "Default miner thread priority %d (nice 19)", opt_priority );
       drop_policy();
    }
    else
@@ -2181,9 +2190,12 @@ static void *miner_thread( void *userdata )
 	      case 4:   prio = -10;   break;
 	      case 5:   prio = -15;
       }
-	   if ( !( thr_id || opt_quiet ) )
-	      applog( LOG_INFO, "Miner thread priority %d (nice %d)",
+	   if ( !thr_id )
+      {
+         applog( LOG_INFO, "User set miner thread priority %d (nice %d)",
                           opt_priority, prio );
+         applog( LOG_WARNING, "High priority mining threads may cause system instability");
+      }
 #endif
       setpriority(PRIO_PROCESS, 0, prio);
 	   if ( opt_priority == 0 )
@@ -2428,13 +2440,17 @@ static void *miner_thread( void *userdata )
              char hr_units[2] = {0,0};
              scale_hash_for_display( &hashrate,  hr_units );
              sprintf( hr, "%.2f", hashrate );
-#if ((defined(_WIN64) || defined(__WINDOWS__)) || defined(_WIN32))
+#if (defined(_WIN64) || defined(__WINDOWS__) || defined(_WIN32))
              applog( LOG_NOTICE, "Total: %s %sH/s", hr, hr_units );
 #else
-             applog( LOG_NOTICE, "Total: %s %sH/s, CPU temp: %dC",
-                                  hr, hr_units, (uint32_t)cpu_temp(0) );
+             float lo_freq = 0., hi_freq = 0.;
+             linux_cpu_hilo_freq( &lo_freq, &hi_freq );
+             applog( LOG_NOTICE,
+                     "Total: %s %sH/s, Temp: %dC, Freq: %.3f/%.3f GHz",
+                     hr, hr_units, (uint32_t)cpu_temp(0), lo_freq / 1e6,
+                     hi_freq / 1e6 );
 #endif
-	       }
+          }
        }  // benchmark
 
        // conditional mining
@@ -2724,10 +2740,10 @@ static void *stratum_thread(void *userdata )
 	          stratum.url = strdup( rpc_url );
 	          applog(LOG_BLUE, "Connection changed to %s", short_url);
           }
-          else // if ( !opt_quiet )
+          else 
 	          applog(LOG_WARNING, "Stratum connection reset");
           // reset stats queue as well
-          s_get_ptr = s_put_ptr = 0;
+          if ( s_get_ptr != s_put_ptr ) s_get_ptr = s_put_ptr = 0;
       }
 
       while ( !stratum.curl )
@@ -2774,13 +2790,15 @@ static void *stratum_thread(void *userdata )
          else
          {
             applog(LOG_WARNING, "Stratum connection interrupted");
-            stratum_disconnect( &stratum );
+//            stratum_disconnect( &stratum );
+            stratum_need_reset = true;
          }
       }
       else
       {
          applog(LOG_ERR, "Stratum connection timeout");
-         stratum_disconnect( &stratum );
+         stratum_need_reset = true;
+//         stratum_disconnect( &stratum );
       }
 
    }  // loop
@@ -2788,6 +2806,189 @@ out:
   return NULL;
 }
 
+static void show_credits()
+{
+   printf("\n         **********  "PACKAGE_NAME" "PACKAGE_VERSION"  *********** \n");
+   printf("     A CPU miner with multi algo support and optimized for CPUs\n");
+   printf("     with AVX512, SHA and VAES extensions by JayDDee.\n");
+   printf("     BTC donation address: 12tdvfF7KmAsihBXQXynT6E6th2c2pByTT\n\n");
+}
+
+#define check_cpu_capability() cpu_capability( false )
+#define display_cpu_capability() cpu_capability( true )
+static bool cpu_capability( bool display_only )
+{
+     char cpu_brand[0x40];
+     bool cpu_has_sse2   = has_sse2();
+     bool cpu_has_aes    = has_aes_ni();
+     bool cpu_has_sse42  = has_sse42();
+     bool cpu_has_avx    = has_avx();
+     bool cpu_has_avx2   = has_avx2();
+     bool cpu_has_sha    = has_sha();
+     bool cpu_has_avx512 = has_avx512();
+     bool cpu_has_vaes   = has_vaes();
+     bool sw_has_aes    = false;
+     bool sw_has_sse2   = false;
+     bool sw_has_sse42  = false;
+     bool sw_has_avx    = false;
+     bool sw_has_avx2   = false;
+     bool sw_has_avx512 = false;
+     bool sw_has_sha    = false;
+     bool sw_has_vaes   = false;
+     set_t algo_features = algo_gate.optimizations;
+     bool algo_has_sse2    = set_incl( SSE2_OPT,    algo_features );
+     bool algo_has_aes     = set_incl( AES_OPT,     algo_features );
+     bool algo_has_sse42   = set_incl( SSE42_OPT,   algo_features );
+     bool algo_has_avx2    = set_incl( AVX2_OPT,    algo_features );
+     bool algo_has_avx512  = set_incl( AVX512_OPT,  algo_features );
+     bool algo_has_sha     = set_incl( SHA_OPT,     algo_features );
+     bool algo_has_vaes    = set_incl( VAES_OPT,    algo_features );
+     bool algo_has_vaes256 = set_incl( VAES256_OPT, algo_features );
+     bool use_aes;
+     bool use_sse2;
+     bool use_sse42;
+     bool use_avx2;
+     bool use_avx512;
+     bool use_sha;
+     bool use_vaes;
+     bool use_none;
+
+     #ifdef __AES__
+       sw_has_aes = true;
+     #endif
+     #ifdef __SSE2__
+         sw_has_sse2 = true;
+     #endif
+     #ifdef __SSE4_2__
+         sw_has_sse42 = true;
+     #endif
+     #ifdef __AVX__
+         sw_has_avx = true;
+     #endif
+     #ifdef __AVX2__
+         sw_has_avx2 = true;
+     #endif
+     #if (defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__) && defined(__AVX512VL__))
+         sw_has_avx512 = true;
+     #endif
+     #ifdef __SHA__
+         sw_has_sha = true;
+     #endif
+     #ifdef __VAES__
+         sw_has_vaes = true;
+     #endif
+
+
+//     #if !((__AES__) || (__SSE2__))
+//         printf("Neither __AES__ nor __SSE2__ defined.\n");
+//     #endif
+
+     cpu_brand_string( cpu_brand );
+     printf( "CPU: %s\n", cpu_brand );
+
+     printf("SW built on " __DATE__
+     #ifdef _MSC_VER
+         " with VC++ 2013\n");
+     #elif defined(__GNUC__)
+         " with GCC");
+        printf(" %d.%d.%d\n", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+     #else
+        printf("\n");
+     #endif
+
+     printf("CPU features: ");
+     if      ( cpu_has_avx512 )    printf( " AVX512" );
+     else if ( cpu_has_avx2   )    printf( " AVX2  " );
+     else if ( cpu_has_avx    )    printf( " AVX   " );
+     else if ( cpu_has_sse42  )    printf( " SSE4.2" );
+     else if ( cpu_has_sse2   )    printf( " SSE2  " );
+     if      ( cpu_has_vaes   )    printf( " VAES"   );
+     else if ( cpu_has_aes    )    printf( "  AES"   );
+     if      ( cpu_has_sha    )    printf( " SHA"    );
+
+     printf("\nSW features:  ");
+     if      ( sw_has_avx512 )    printf( " AVX512" );
+     else if ( sw_has_avx2   )    printf( " AVX2  " );
+     else if ( sw_has_avx    )    printf( " AVX   " );
+     else if ( sw_has_sse42  )    printf( " SSE4.2" );
+     else if ( sw_has_sse2   )    printf( " SSE2  " );
+     if      ( sw_has_vaes   )    printf( " VAES"   );
+     else if ( sw_has_aes    )    printf( "  AES"   );
+     if      ( sw_has_sha    )    printf( " SHA"    );
+
+     printf("\nAlgo features:");
+     if ( algo_features == EMPTY_SET ) printf( " None" );
+     else
+     {
+        if      ( algo_has_avx512 )    printf( " AVX512" );
+        else if ( algo_has_avx2   )    printf( " AVX2  " );
+        else if ( algo_has_sse42  )    printf( " SSE4.2" );
+        else if ( algo_has_sse2   )    printf( " SSE2  " );
+        if      ( algo_has_vaes   )    printf( " VAES"   );
+        else if ( algo_has_aes    )    printf( "  AES"   );
+        if      ( algo_has_sha    )    printf( " SHA"    );
+     }
+     printf("\n");
+
+     if ( display_only ) return true;
+
+     // Check for CPU and build incompatibilities
+     if ( !cpu_has_sse2 )
+     {
+        printf( "A CPU with SSE2 is required to use cpuminer-opt\n" );
+        return false;
+     }
+     if ( sw_has_avx2 && !( cpu_has_avx2 && cpu_has_aes ) )
+     {
+        printf( "The SW build requires a CPU with AES and AVX2!\n" );
+        return false;
+     }
+     if ( sw_has_sse42 && !cpu_has_sse42 )
+     {
+        printf( "The SW build requires a CPU with SSE4.2!\n" );
+        return false;
+     }
+     if ( sw_has_aes && !cpu_has_aes )
+     {
+        printf( "The SW build requires a CPU with AES!\n" );
+        return false;
+     }
+     if ( sw_has_sha && !cpu_has_sha )
+     {
+        printf( "The SW build requires a CPU with SHA!\n" );
+        return false;
+     }
+
+     // Determine mining options
+     use_sse2   = cpu_has_sse2   && algo_has_sse2;
+     use_aes    = cpu_has_aes    && sw_has_aes    && algo_has_aes;
+     use_sse42  = cpu_has_sse42  && sw_has_sse42  && algo_has_sse42;
+     use_avx2   = cpu_has_avx2   && sw_has_avx2   && algo_has_avx2;
+     use_avx512 = cpu_has_avx512 && sw_has_avx512 && algo_has_avx512;
+     use_sha    = cpu_has_sha    && sw_has_sha    && algo_has_sha;
+     use_vaes   = cpu_has_vaes   && sw_has_vaes   && algo_has_vaes
+          && ( use_avx512 || algo_has_vaes256 );
+     use_none = !( use_sse2 || use_aes || use_sse42 || use_avx512 || use_avx2 ||
+                   use_sha || use_vaes );
+
+     // Display best options
+     printf( "\nStarting miner with" );
+     if         ( use_none ) printf( " no optimizations" );
+     else
+     {
+        if      ( use_avx512 ) printf( " AVX512" );
+        else if ( use_avx2   ) printf( " AVX2"   );
+        else if ( use_sse42  ) printf( " SSE4.2" );
+        else if ( use_sse2   ) printf( " SSE2"   );
+        if      ( use_vaes   ) printf( " VAES"   );
+        else if ( use_aes    ) printf( " AES"    );
+        if      ( use_sha    ) printf( " SHA"    );
+     }
+     printf( "...\n\n" );
+
+     return true;
+}
+        
 void show_version_and_exit(void)
 {
         printf("\n built on " __DATE__
@@ -2835,7 +3036,6 @@ void show_version_and_exit(void)
 #endif
                 "\n\n");
 
-        /* dependencies versions */
         printf("%s\n", curl_version());
 #ifdef JANSSON_VERSION
         printf("jansson/%s ", JANSSON_VERSION);
@@ -2846,7 +3046,6 @@ void show_version_and_exit(void)
         printf("\n");
         exit(0);
 }
-
 
 void show_usage_and_exit(int status)
 {
@@ -3184,14 +3383,12 @@ void parse_arg(int key, char *arg )
 			ul = strtoull( p, NULL, 16 );
 		else
 			ul = atoll( arg );
-//		if ( ul > ( 1ULL << num_cpus ) - 1ULL )
-//			ul = -1LL;
 #if AFFINITY_USES_UINT128
 // replicate the low 64 bits to make a full 128 bit mask if there are more
 // than 64 CPUs, otherwise zero extend the upper half.
          opt_affinity = (uint128_t)ul;
          if ( num_cpus > 64 )
-            opt_affinity = (opt_affinity << 64 ) | opt_affinity;
+            opt_affinity |= opt_affinity << 64;
 #else
          opt_affinity = ul;
 #endif
@@ -3235,11 +3432,15 @@ void parse_arg(int key, char *arg )
 	case 1024:
 		opt_randomize = true;
 		break;
-   case 1026:
-      opt_reset_on_stale = true;
+   case 1027:  // data-file
+      opt_data_file = strdup( arg );
+      break;
+   case 1028:  // verify
+      opt_verify = true;
       break;
 	case 'V':
-		show_version_and_exit();
+      display_cpu_capability();
+      exit(0);
 	case 'h':
 		show_usage_and_exit(0);
 
@@ -3356,185 +3557,6 @@ static int thread_create(struct thr_info *thr, void* func)
 	return err;
 }
 
-static void show_credits()
-{
-   printf("\n         **********  "PACKAGE_NAME" "PACKAGE_VERSION"  *********** \n");
-   printf("     A CPU miner with multi algo support and optimized for CPUs\n");
-   printf("     with AVX512, SHA and VAES extensions by JayDDee.\n");
-   printf("     BTC donation address: 12tdvfF7KmAsihBXQXynT6E6th2c2pByTT\n\n");
-}
-
-bool check_cpu_capability ()
-{
-     char cpu_brand[0x40];
-     bool cpu_has_sse2   = has_sse2();
-     bool cpu_has_aes    = has_aes_ni();
-     bool cpu_has_sse42  = has_sse42();
-     bool cpu_has_avx    = has_avx();
-     bool cpu_has_avx2   = has_avx2();
-     bool cpu_has_sha    = has_sha();
-     bool cpu_has_avx512 = has_avx512();
-     bool cpu_has_vaes   = has_vaes();
-     bool sw_has_aes    = false;
-     bool sw_has_sse2   = false;
-     bool sw_has_sse42  = false;
-     bool sw_has_avx    = false;
-     bool sw_has_avx2   = false;
-     bool sw_has_avx512 = false;
-     bool sw_has_sha    = false;
-     bool sw_has_vaes   = false;
-     set_t algo_features = algo_gate.optimizations;
-     bool algo_has_sse2    = set_incl( SSE2_OPT,    algo_features );
-     bool algo_has_aes     = set_incl( AES_OPT,     algo_features );
-     bool algo_has_sse42   = set_incl( SSE42_OPT,   algo_features );
-     bool algo_has_avx2    = set_incl( AVX2_OPT,    algo_features );
-     bool algo_has_avx512  = set_incl( AVX512_OPT,  algo_features );
-     bool algo_has_sha     = set_incl( SHA_OPT,     algo_features );
-     bool algo_has_vaes    = set_incl( VAES_OPT,    algo_features );
-     bool algo_has_vaes256 = set_incl( VAES256_OPT, algo_features );
-     bool use_aes;
-     bool use_sse2;
-     bool use_sse42;
-     bool use_avx2;
-     bool use_avx512;
-     bool use_sha;
-     bool use_vaes;
-     bool use_none;
-
-     #ifdef __AES__
-       sw_has_aes = true;
-     #endif
-     #ifdef __SSE2__
-         sw_has_sse2 = true;
-     #endif
-     #ifdef __SSE4_2__
-         sw_has_sse42 = true;
-     #endif
-     #ifdef __AVX__
-         sw_has_avx = true;
-     #endif
-     #ifdef __AVX2__
-         sw_has_avx2 = true;
-     #endif
-     #if (defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__) && defined(__AVX512VL__))
-         sw_has_avx512 = true;
-     #endif
-     #ifdef __SHA__
-         sw_has_sha = true;
-     #endif
-     #ifdef __VAES__
-         sw_has_vaes = true;
-     #endif
-         
-
-//     #if !((__AES__) || (__SSE2__))
-//         printf("Neither __AES__ nor __SSE2__ defined.\n");
-//     #endif
-
-     cpu_brand_string( cpu_brand );
-     printf( "CPU: %s\n", cpu_brand );
-     
-     printf("SW built on " __DATE__
-     #ifdef _MSC_VER
-         " with VC++ 2013\n");
-     #elif defined(__GNUC__)
-         " with GCC");
-        printf(" %d.%d.%d\n", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
-     #else
-        printf("\n");
-     #endif
-
-     printf("CPU features: ");
-     if      ( cpu_has_avx512 )    printf( " AVX512" );
-     else if ( cpu_has_avx2   )    printf( " AVX2  " );
-     else if ( cpu_has_avx    )    printf( " AVX   " );
-     else if ( cpu_has_sse42  )    printf( " SSE4.2" );
-     else if ( cpu_has_sse2   )    printf( " SSE2  " );
-     if      ( cpu_has_vaes   )    printf( " VAES"   );
-     else if ( cpu_has_aes    )    printf( "  AES"   );
-     if      ( cpu_has_sha    )    printf( " SHA"    );
-
-     printf("\nSW features:  ");
-     if      ( sw_has_avx512 )    printf( " AVX512" );
-     else if ( sw_has_avx2   )    printf( " AVX2  " );
-     else if ( sw_has_avx    )    printf( " AVX   " );
-     else if ( sw_has_sse42  )    printf( " SSE4.2" );
-     else if ( sw_has_sse2   )    printf( " SSE2  " );
-     if      ( sw_has_vaes   )    printf( " VAES"   );
-     else if ( sw_has_aes    )    printf( "  AES"   );
-     if      ( sw_has_sha    )    printf( " SHA"    );
-
-     printf("\nAlgo features:");
-     if ( algo_features == EMPTY_SET ) printf( " None" );
-     else
-     {
-        if      ( algo_has_avx512 )    printf( " AVX512" );
-        else if ( algo_has_avx2   )    printf( " AVX2  " );
-        else if ( algo_has_sse42  )    printf( " SSE4.2" );
-        else if ( algo_has_sse2   )    printf( " SSE2  " );
-        if      ( algo_has_vaes   )    printf( " VAES"   );
-        else if ( algo_has_aes    )    printf( "  AES"   );
-        if      ( algo_has_sha    )    printf( " SHA"    );
-     }
-     printf("\n");
-
-     // Check for CPU and build incompatibilities
-     if ( !cpu_has_sse2 )
-     {
-        printf( "A CPU with SSE2 is required to use cpuminer-opt\n" );
-        return false;
-     }
-     if ( sw_has_avx2 && !( cpu_has_avx2 && cpu_has_aes ) )
-     {
-        printf( "The SW build requires a CPU with AES and AVX2!\n" );
-        return false;
-     }
-     if ( sw_has_sse42 && !cpu_has_sse42 )
-     {
-        printf( "The SW build requires a CPU with SSE4.2!\n" );
-        return false;
-     }
-     if ( sw_has_aes && !cpu_has_aes )
-     {
-        printf( "The SW build requires a CPU with AES!\n" );
-        return false;
-     }
-     if ( sw_has_sha && !cpu_has_sha )
-     {
-        printf( "The SW build requires a CPU with SHA!\n" );
-        return false;
-     }
-
-     // Determine mining options
-     use_sse2   = cpu_has_sse2   && algo_has_sse2;
-     use_aes    = cpu_has_aes    && sw_has_aes    && algo_has_aes;
-     use_sse42  = cpu_has_sse42  && sw_has_sse42  && algo_has_sse42;
-     use_avx2   = cpu_has_avx2   && sw_has_avx2   && algo_has_avx2;
-     use_avx512 = cpu_has_avx512 && sw_has_avx512 && algo_has_avx512;
-     use_sha    = cpu_has_sha    && sw_has_sha    && algo_has_sha;
-     use_vaes   = cpu_has_vaes   && sw_has_vaes   && algo_has_vaes 
-	       && ( use_avx512 || algo_has_vaes256 );   
-     use_none = !( use_sse2 || use_aes || use_sse42 || use_avx512 || use_avx2 ||
-                   use_sha || use_vaes );
-      
-     // Display best options
-     printf( "\nStarting miner with" );
-     if         ( use_none ) printf( " no optimizations" );
-     else
-     {
-        if      ( use_avx512 ) printf( " AVX512" );
-        else if ( use_avx2   ) printf( " AVX2"   );
-        else if ( use_sse42  ) printf( " SSE4.2" );
-        else if ( use_sse2   ) printf( " SSE2"   );
-        if      ( use_vaes   ) printf( " VAES"   );
-        else if ( use_aes    ) printf( " AES"    );
-        if      ( use_sha    ) printf( " SHA"    );
-     }
-     printf( "...\n\n" );
-
-     return true;
-}
-
 void get_defconfig_path(char *out, size_t bufsize, char *argv0);
 
 int main(int argc, char *argv[])
@@ -3596,6 +3618,11 @@ int main(int argc, char *argv[])
       fprintf(stderr, "%s: no algo supplied\n", argv[0]);
       show_usage_and_exit(1);
    }
+
+   if ( !register_algo_gate( opt_algo, &algo_gate ) )  exit(1);
+
+   if ( !check_cpu_capability() ) exit(1);
+   
 	if ( !opt_benchmark )
    {
       if ( !short_url )
@@ -3635,7 +3662,7 @@ int main(int argc, char *argv[])
 	}
 
    // All options must be set before starting the gate
-   if ( !register_algo_gate( opt_algo, &algo_gate ) ) exit(1);
+//   if ( !register_algo_gate( opt_algo, &algo_gate ) )  exit(1);
 
    if ( coinbase_address )
    {
@@ -3654,7 +3681,7 @@ int main(int argc, char *argv[])
    memcpy( &five_min_start, &last_submit_time, sizeof (struct timeval) );
    memcpy( &session_start, &last_submit_time, sizeof (struct timeval) );
 
-   if ( !check_cpu_capability() ) exit(1);
+//   if ( !check_cpu_capability() ) exit(1);
 
 	pthread_mutex_init( &stats_lock, NULL );
    pthread_rwlock_init( &g_work_lock, NULL );
